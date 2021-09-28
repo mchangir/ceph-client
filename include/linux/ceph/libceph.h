@@ -37,7 +37,7 @@
 #define CEPH_OPT_ABORT_ON_FULL    (1<<6) /* abort w/ ENOSPC when full */
 #define CEPH_OPT_RXBOUNCE         (1<<7) /* double-buffer read data */
 
-#define CEPH_OPT_DEFAULT   (CEPH_OPT_TCP_NODELAY)
+#define CEPH_OPT_DEFAULT   (CEPH_OPT_TCP_NODELAY | CEPH_OPT_RXBOUNCE)
 
 #define ceph_set_opt(client, opt) \
 	(client)->options->flags |= CEPH_OPT_##opt;
