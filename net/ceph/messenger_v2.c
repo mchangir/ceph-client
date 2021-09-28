@@ -1733,7 +1733,7 @@ static int prepare_read_control_remainder(struct ceph_connection *con)
 	return 0;
 }
 
-static void prepare_read_data(struct ceph_connection *con)
+static int prepare_read_data(struct ceph_connection *con)
 {
 	struct bio_vec bv;
 
@@ -1743,24 +1743,58 @@ static void prepare_read_data(struct ceph_connection *con)
 				  data_len(con->in_msg));
 
 	get_bvec_at(&con->v2.in_cursor, &bv);
-	set_in_bvec(con, &bv);
+	if (!con_secure(con) &&
+	    ceph_test_opt(from_msgr(con->msgr), RXBOUNCE)) {
+		if (unlikely(!con->bounce_page)) {
+			con->bounce_page = alloc_page(GFP_NOIO);
+			if (!con->bounce_page) {
+				pr_err("failed to allocate bounce page\n");
+				return -ENOMEM;
+			}
+		}
+
+		bv.bv_page = con->bounce_page;
+		bv.bv_offset = 0;
+		set_in_bvec(con, &bv);
+	} else {
+		set_in_bvec(con, &bv);
+	}
 	con->v2.in_state = IN_S_PREPARE_READ_DATA_CONT;
+	return 0;
 }
 
 static void prepare_read_data_cont(struct ceph_connection *con)
 {
 	struct bio_vec bv;
 
-	if (!con_secure(con))
+	if (!con_secure(con) &&
+	    ceph_test_opt(from_msgr(con->msgr), RXBOUNCE)) {
+		con->in_data_crc = crc32c(con->in_data_crc,
+					  page_address(con->bounce_page),
+					  con->v2.in_bvec.bv_len);
+
+		get_bvec_at(&con->v2.in_cursor, &bv);
+		memcpy_to_page(bv.bv_page, bv.bv_offset,
+			       page_address(con->bounce_page),
+			       con->v2.in_bvec.bv_len);
+	} else if (!con_secure(con)) {
 		con->in_data_crc = ceph_crc32c_page(con->in_data_crc,
 						    con->v2.in_bvec.bv_page,
 						    con->v2.in_bvec.bv_offset,
 						    con->v2.in_bvec.bv_len);
+	}
 
 	ceph_msg_data_advance(&con->v2.in_cursor, con->v2.in_bvec.bv_len);
 	if (con->v2.in_cursor.total_resid) {
 		get_bvec_at(&con->v2.in_cursor, &bv);
-		set_in_bvec(con, &bv);
+		if (!con_secure(con) &&
+		    ceph_test_opt(from_msgr(con->msgr), RXBOUNCE)) {
+			bv.bv_page = con->bounce_page;
+			bv.bv_offset = 0;
+			set_in_bvec(con, &bv);
+		} else {
+			set_in_bvec(con, &bv);
+		}
 		WARN_ON(con->v2.in_state != IN_S_PREPARE_READ_DATA_CONT);
 		return;
 	}
@@ -2593,8 +2627,7 @@ static int __handle_control(struct ceph_connection *con, void *p)
 		if (!data_len(msg))
 			return process_message(con);
 
-		prepare_read_data(con);
-		return 0;
+		return prepare_read_data(con);
 	}
 
 	reset_in_kvecs(con);
@@ -2785,8 +2818,7 @@ static int populate_in_iter(struct ceph_connection *con)
 			ret = handle_control_remainder(con);
 			break;
 		case IN_S_PREPARE_READ_DATA:
-			prepare_read_data(con);
-			ret = 0;
+			ret = prepare_read_data(con);
 			break;
 		case IN_S_PREPARE_READ_DATA_CONT:
 			prepare_read_data_cont(con);
